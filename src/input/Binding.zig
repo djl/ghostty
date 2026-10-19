@@ -672,10 +672,10 @@ pub const Action = union(enum) {
     ///     process is not running
     toggle_readonly,
 
-    /// Label every link visible in the viewport (see the `link` option) with
-    /// a short key sequence, like Alacritty's hints. Typing a label acts on
-    /// that link. Escape cancels and backspace undoes a key. All other keys
-    /// are swallowed while the labels are shown.
+    /// Label every link visible in the viewport (see the `link` option) and
+    /// every OSC 8 hyperlink with a short key sequence, like Alacritty's
+    /// hints. Typing a label acts on that link. Escape cancels and backspace
+    /// undoes a key. All other keys are swallowed while the labels are shown.
     ///
     /// Valid values:
     ///

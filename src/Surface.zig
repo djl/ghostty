@@ -4598,8 +4598,58 @@ const Hints = struct {
     const Item = struct {
         hint: rendererpkg.State.Hint,
         text: [:0]const u8,
+
+        /// OSC 8 hyperlink this came from, zero for a configured link.
+        link_id: terminal.hyperlink.Id = 0,
     };
 };
+
+/// Append one hint per OSC 8 hyperlink visible in the viewport region. A
+/// link that spans rows is only labeled once, at its first cell.
+fn hintsAppendOsc8(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    items: *std.ArrayList(Hints.Item),
+    max_items: usize,
+) !void {
+    const tl = screen.pages.getTopLeft(.viewport);
+    const br = screen.pages.getBottomRight(.viewport) orelse return;
+    const tl_pt = screen.pages.pointFromPin(.viewport, tl) orelse return;
+    const br_pt = screen.pages.pointFromPin(.viewport, br) orelse return;
+    var chunks = screen.pages.pageIterator(.right_down, tl_pt, br_pt);
+    while (chunks.next()) |chunk| {
+        const page = chunk.node.page();
+        for (chunk.rows(), chunk.start..) |*row, y| {
+            const cells = page.getCells(row);
+            for (cells, 0..) |*cell, x| {
+                if (items.items.len >= max_items) return;
+                // The page row can be wider than the viewport.
+                if (x > br.x) break;
+                const id = page.lookupHyperlink(cell) orelse continue;
+                var seen = false;
+                for (items.items) |item| {
+                    if (item.link_id == id) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) continue;
+
+                const uri = page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+                if (uri.len == 0) continue;
+                const pin: terminal.Pin = .{ .node = chunk.node, .y = @intCast(y), .x = @intCast(x) };
+                const vp = screen.pages.pointFromPin(.viewport, pin) orelse continue;
+                const text = try alloc.dupeZ(u8, uri);
+                errdefer alloc.free(text);
+                try items.append(alloc, .{
+                    .hint = .{ .x = vp.viewport.x, .y = @intCast(vp.viewport.y), .label = undefined, .len = 0, .typed = 0 },
+                    .text = text,
+                    .link_id = id,
+                });
+            }
+        }
+    }
+}
 
 /// Label the links in the viewport and enter hint mode.
 fn hintsStart(self: *Surface, mode: input.Binding.UrlHints) !void {
@@ -4636,15 +4686,20 @@ fn hintsStart(self: *Surface, mode: input.Binding.UrlHints) !void {
     }
 
     // shortcut: two-char labels cap us at alphabet.len^2 links, plenty for a viewport.
+    const max_items = alphabet.len * alphabet.len;
     for (self.config.links) |link| {
         if (link.action != .open) continue;
         var it = strmap.searchIterator(link.regex);
         while (try it.next()) |m_| {
             var m = m_;
             defer m.deinit();
-            if (items.items.len >= alphabet.len * alphabet.len) break;
+            if (items.items.len >= max_items) break;
             const sel = m.selection();
-            const vp = screen.pages.pointFromPin(.viewport, sel.start()) orelse continue;
+            const start = sel.start();
+            // OSC 8 hyperlinks are labeled below with their URI, so don't
+            // label the text of one a second time.
+            if (start.node.page().lookupHyperlink(start.rowAndCell().cell) != null) continue;
+            const vp = screen.pages.pointFromPin(.viewport, start) orelse continue;
             const text = try screen.selectionString(self.alloc, .{ .sel = sel, .trim = false });
             errdefer self.alloc.free(text);
             try items.append(self.alloc, .{
@@ -4652,6 +4707,10 @@ fn hintsStart(self: *Surface, mode: input.Binding.UrlHints) !void {
                 .text = text,
             });
         }
+    }
+
+    if (self.config.link_osc8) {
+        try hintsAppendOsc8(self.alloc, screen, &items, max_items);
     }
     if (items.items.len == 0) return;
 
@@ -4687,6 +4746,46 @@ test "hint labels" {
     var seen: [9][2]u8 = undefined;
     for (&seen, 0..) |*l, i| l.* = hintLabel(abc, 2, i);
     for (seen, 0..) |a, i| for (seen[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "hint osc8 links" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try terminal.Screen.init(testing.io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    try s.startHyperlink("https://example.com/one", null);
+    try s.testWriteString("one");
+    s.endHyperlink();
+    try s.testWriteString(" ");
+    try s.startHyperlink("https://example.com/two", null);
+    try s.testWriteString("two");
+    s.endHyperlink();
+
+    // A third link whose text wraps onto the next row.
+    try s.startHyperlink("https://example.com/long", null);
+    try s.testWriteString("a" ** 30);
+    s.endHyperlink();
+
+    var items: std.ArrayList(Hints.Item) = .empty;
+    defer {
+        for (items.items) |item| alloc.free(item.text);
+        items.deinit(alloc);
+    }
+    try hintsAppendOsc8(alloc, &s, &items, 100);
+
+    // One hint per link: the wrapped link is not labeled once per row.
+    try testing.expectEqual(@as(usize, 3), items.items.len);
+    try testing.expectEqualStrings("https://example.com/one", items.items[0].text);
+    try testing.expectEqual(@as(u16, 0), items.items[0].hint.x);
+    try testing.expectEqualStrings("https://example.com/two", items.items[1].text);
+    try testing.expectEqual(@as(u16, 4), items.items[1].hint.x);
+    try testing.expectEqualStrings("https://example.com/long", items.items[2].text);
 }
 
 /// Publish the labels matching the typed prefix to the renderer. Requires
